@@ -168,7 +168,7 @@ class DummyDeployer(object):
     node_uuid = uuid4()
     poll_interval = timedelta(seconds=1.0)
 
-    def discover_state(self, node_state):
+    def discover_state(self, cluster_state):
         return succeed(DummyLocalState())
 
     def calculate_changes(self, desired_configuration, cluster_state,
@@ -199,7 +199,7 @@ class ControllableDeployer(object):
         self.calculate_inputs = []
         self.poll_interval = poll_interval
 
-    def discover_state(self, node_state):
+    def discover_state(self, cluster_state):
         state = self.local_states.pop(0)
         if isinstance(state, Exception):
             raise state

@@ -68,13 +68,13 @@ class IDeployer(Interface):
     hostname = Attribute("")
     poll_interval = Attribute("")
 
-    def discover_state(local_state):
+    def discover_state(cluster_state):
         """
         Discover the local state, i.e. the state which is exclusively under
         the purview of the convergence agent running this instance.
 
-        :param NodeState local_state: The previously known state of this
-            node. This may include information that this deployer cannot
+        :param DeploymentState local_state: The previously known state of the
+            cluster. This may include information that this deployer cannot
             discover on its own. Information here should NOT be copied
             into the result; the return result should include only
             information discovered by this particular deployer.

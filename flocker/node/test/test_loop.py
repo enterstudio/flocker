@@ -1121,6 +1121,15 @@ class ConvergenceLoopFSMTests(SynchronousTestCase):
              [(NodeStateCommand, dict(state_changes=(local_state,)))],
              [(NodeStateCommand, dict(state_changes=(local_state2,)))]))
 
+    def test_discover_states_gets_cluster_state(self):
+        """
+        ``IDeployer.discover_state`` gets passed the entire cluster state.
+
+        Should also exist tests of ``IDeployer`` implementations that the
+        correctly accept a ``DeploymentState``.
+        """
+        raise NotImplementedError("Test not implemented yet.")
+
 
 class UpdateNodeEraLocator(CommandLocator):
     """
