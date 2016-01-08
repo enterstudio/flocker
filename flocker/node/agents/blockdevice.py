@@ -15,7 +15,12 @@ from datetime import timedelta
 from eliot import MessageType, ActionType, Field, Logger
 from eliot.serializers import identity
 
-from zope.interface import implementer, Interface, provider
+from zope.interface import (
+    implementer,
+    provider,
+    Interface,
+    Attribute as InterfaceAttribute,
+)
 
 from pyrsistent import PClass, field, pmap_field, pset_field, thaw, CheckedPMap
 
@@ -78,6 +83,7 @@ class DatasetStates(Names):
     DELETED = NamedConstant()
 
 
+# TODO: Need to split this and DesiredDataset into cloud and node variants?
 class DiscoveredDataset(PClass):
     """
     Dataset as discovered by deployer.
@@ -1415,6 +1421,7 @@ class DoNothing(PClass):
 # IStateChange factory. (The factory is expected to take
 # ``desired_dataset`` and ``discovered_dataset``.
 Desired = Discovered = DatasetStates
+# TODO: Need to split this up into NODE_TRANSITIONS and CLOUD_TRANSITIONS
 DATASET_TRANSITIONS = TransitionTable.create({
     Desired.MOUNTED: {
         Discovered.NON_EXISTENT: CreateBlockDeviceDataset,
@@ -1506,81 +1513,74 @@ class BlockDeviceCalculator(PClass):
         return in_parallel(changes=actions)
 
 
-@implementer(IDeployer)
-class BlockDeviceDeployer(PClass):
-    """
-    An ``IDeployer`` that operates on ``IBlockDeviceAPI`` providers.
+class IDiscoverState(Interface):
+    calculator = InterfaceAttribute('ICalculator to calculate changes')
 
-    :ivar unicode hostname: The IP address of the node that has this deployer.
-    :ivar UUID node_uuid: The UUID of the node that has this deployer.
-    :ivar IBlockDeviceAPI block_device_api: The block device API that will be
-        called upon to perform block device operations.
-    :ivar IProfiledBlockDeviceAPI _profiled_blockdevice_api: The block device
-        API that will be called upon to perform block device operations with
-        profiles.
-    :ivar FilePath mountroot: The directory where block devices will be
-        mounted.
-    :ivar _async_block_device_api: An object to override the value of the
-        ``async_block_device_api`` property.  Used by tests.  Should be
-        ``None`` in real-world use.
-    :ivar block_device_manager: An ``IBlockDeviceManager`` implementation used
-        to interact with the system regarding block devices.
-    :ivar ICalculator calculator: The object to use to calculate dataset
-        changes.
-    """
-    hostname = field(type=unicode, mandatory=True)
-    node_uuid = field(type=UUID, mandatory=True)
-    block_device_api = field(mandatory=True)
-    _profiled_blockdevice_api = field(mandatory=True, initial=None)
-    _async_block_device_api = field(mandatory=True, initial=None)
-    mountroot = field(type=FilePath, initial=FilePath(b"/flocker"))
-    poll_interval = timedelta(seconds=60.0)
-    block_device_manager = field(initial=BlockDeviceManager())
-    calculator = field(
-        invariant=provides(ICalculator),
-        mandatory=True,
-        initial=BlockDeviceCalculator(),
-    )
+    def discover_state(cluster_state):
+        """
+        """
 
-    @property
-    def profiled_blockdevice_api(self):
+    def calculate_desired_states(configuration):
         """
-        Get an ``IProfiledBlockDeviceAPI`` provider which can create volumes
-        configured based on pre-defined profiles. This will use the
-        _profiled_blockdevice_api attribute, falling back to the
-        block_device_api attributed and finally an adapter implementation
-        around the block_device_api if neither of those provide the interface.
         """
-        if IProfiledBlockDeviceAPI.providedBy(self._profiled_blockdevice_api):
-            return self._profiled_blockdevice_api
-        if IProfiledBlockDeviceAPI.providedBy(self.block_device_api):
-            return self.block_device_api
-        return ProfiledBlockDeviceAPIAdapter(
-            _blockdevice_api=self.block_device_api
+        # TODO: Figure out how to represent information necesarry to deal with
+        # with leases.
+
+
+@implementer(IDiscoverState)
+class CloudDiscoverState(object):
+    calculator = BlockDeviceCalculator(transitions=CLOUD_TRANSTIONS),
+
+    def discover_state(self, cluster_state):
+        api = self.block_device_api
+        volumes = api.list_volumes()
+
+        datasets = {}
+        for volume in volumes:
+            dataset_id = volume.dataset_id
+            if volume.attached_to is None:
+                # XXX We check for attached locally for the case
+                # where the volume is attached but the
+                # blockdevice doesn't exist yet.
+                datasets[dataset_id] = DiscoveredDataset(
+                    state=DatasetStates.NON_MANIFEST,
+                    dataset_id=dataset_id,
+                    maximum_size=volume.size,
+                    blockdevice_id=volume.blockdevice_id,
+                )
+            else:
+                datasets[dataset_id] = DiscoveredDataset(
+                    state=DatasetStates.ATTACHED_ELSEWHERE,
+                    dataset_id=dataset_id,
+                    maximum_size=volume.size,
+                    blockdevice_id=volume.blockdevice_id,
+                )
+
+        local_state = LocalStateForCloud(
+            node_uuid=self.node_uuid,
+            hostname=self.hostname,
+            datasets=datasets,
         )
 
-    @property
-    def async_block_device_api(self):
-        """
-        Get an ``IBlockDeviceAsyncAPI`` provider which can manipulate volumes
-        for this deployer.
+        return succeed(local_state)
 
-        During real operation, this is a threadpool-based wrapper around the
-        ``IBlockDeviceAPI`` provider.  For testing purposes it can be
-        overridden with a different object entirely (and this large amount of
-        support code for this is necessary because this class is a ``PClass``
-        subclass).
-        """
-        if self._async_block_device_api is None:
-            from twisted.internet import reactor
-            return _SyncToThreadedAsyncAPIAdapter(
-                _sync=self.block_device_api,
-                _reactor=reactor,
-                _threadpool=reactor.getThreadPool(),
+    def calculate_desired_states(self, configuration):
+        desired_datasets = {
+            UUID(manifestation.dataset.dataset_id):
+            self._calculate_desired_for_manifestation(
+                manifestation
             )
-        return self._async_block_device_api
+            for node in configuration.nodes
+            for manifestation in node.manifestations.values()
+        }
+        return desired_datasets
 
-    def _discover_raw_state(self):
+
+@implementer(IDiscoverState)
+class NodeDiscoverState(object):
+    calculator = BlockDeviceCalculator(transitions=NODE_TRANSTIONS),
+
+    def _discover_raw_state(self, volumes):
         """
         Find the state of this node that is relevant to determining which
         datasets are on this node, and return a ``RawState`` containing that
@@ -1589,7 +1589,6 @@ class BlockDeviceDeployer(PClass):
         # FLOC-1819 Make this asynchronous
         api = self.block_device_api
         compute_instance_id = api.compute_instance_id()
-        volumes = api.list_volumes()
         system_mounts = {
             mount.blockdevice: mount.mountpoint
             for mount in self.block_device_manager.get_mounts()
@@ -1637,7 +1636,7 @@ class BlockDeviceDeployer(PClass):
         return a ``BlockDeviceDeployerLocalState`` containing all the datasets
         that are not manifest or are located on this node.
         """
-        raw_state = self._discover_raw_state()
+        raw_state = self._discover_raw_state(volumes=cluster_state.volumes)
 
         datasets = {}
         for volume in raw_state.volumes:
@@ -1698,54 +1697,7 @@ class BlockDeviceDeployer(PClass):
 
         return succeed(local_state)
 
-    def _mountpath_for_dataset_id(self, dataset_id):
-        """
-        Calculate the mountpoint for a dataset.
-
-        :param unicode dataset_id: The unique identifier of the dataset for
-            which to calculate a mount point.
-
-        :returns: A ``FilePath`` of the mount point.
-        """
-        return self.mountroot.child(dataset_id.encode("ascii"))
-
-    def _calculate_desired_for_manifestation(self, manifestation):
-        """
-        Get the ``DesiredDataset`` corresponding to a given manifestation.
-
-        :param Manifestation manifestation: The
-
-        :return: The ``DesiredDataset`` corresponding to the given
-            manifestation.
-        """
-        dataset_id = UUID(manifestation.dataset.dataset_id)
-        # XXX: Make this configurable. FLOC-2679
-        maximum_size = manifestation.dataset.maximum_size
-        if maximum_size is None:
-            maximum_size = int(DEFAULT_DATASET_SIZE.bytes)
-
-        common_args = {
-            'dataset_id': dataset_id,
-            'metadata': manifestation.dataset.metadata,
-        }
-        if manifestation.dataset.deleted:
-            return DesiredDataset(
-                state=DatasetStates.DELETED,
-                **common_args
-            )
-        else:
-            return DesiredDataset(
-                state=DatasetStates.MOUNTED,
-                maximum_size=maximum_size,
-                mount_point=self._mountpath_for_dataset_id(
-                    unicode(dataset_id)
-                ),
-                **common_args
-            )
-
-    def _calculate_desired_state(
-        self, configuration, local_applications, local_datasets
-    ):
+    def calculate_desired_states(self, configuration):
         not_in_use = NotInUseDatasets(
             node_uuid=self.node_uuid,
             local_applications=local_applications,
@@ -1793,6 +1745,100 @@ class BlockDeviceDeployer(PClass):
 
         return desired_datasets
 
+
+@implementer(IDeployer)
+class BlockDeviceDeployer(PClass):
+    """
+    An ``IDeployer`` that operates on ``IBlockDeviceAPI`` providers.
+
+    :ivar unicode hostname: The IP address of the node that has this deployer.
+    :ivar UUID node_uuid: The UUID of the node that has this deployer.
+    :ivar IBlockDeviceAPI block_device_api: The block device API that will be
+        called upon to perform block device operations.
+    :ivar IProfiledBlockDeviceAPI _profiled_blockdevice_api: The block device
+        API that will be called upon to perform block device operations with
+        profiles.
+    :ivar FilePath mountroot: The directory where block devices will be
+        mounted.
+    :ivar _async_block_device_api: An object to override the value of the
+        ``async_block_device_api`` property.  Used by tests.  Should be
+        ``None`` in real-world use.
+    :ivar block_device_manager: An ``IBlockDeviceManager`` implementation used
+        to interact with the system regarding block devices.
+    :ivar ICalculator calculator: The object to use to calculate dataset
+        changes.
+    """
+    hostname = field(type=unicode, mandatory=True)
+    node_uuid = field(type=UUID, mandatory=True)
+    block_device_api = field(mandatory=True)
+    _profiled_blockdevice_api = field(mandatory=True, initial=None)
+    _async_block_device_api = field(mandatory=True, initial=None)
+    mountroot = field(type=FilePath, initial=FilePath(b"/flocker"))
+    poll_interval = timedelta(seconds=60.0)
+    block_device_manager = field(initial=BlockDeviceManager())
+    # TODO: Need to provide factories that populate this appropriately
+    state_discoverer = field(
+        invariant=provides(IDiscoverState),
+        mandatory=True,
+    )
+
+    @property
+    def profiled_blockdevice_api(self):
+        """
+        Get an ``IProfiledBlockDeviceAPI`` provider which can create volumes
+        configured based on pre-defined profiles. This will use the
+        _profiled_blockdevice_api attribute, falling back to the
+        block_device_api attributed and finally an adapter implementation
+        around the block_device_api if neither of those provide the interface.
+        """
+        if IProfiledBlockDeviceAPI.providedBy(self._profiled_blockdevice_api):
+            return self._profiled_blockdevice_api
+        if IProfiledBlockDeviceAPI.providedBy(self.block_device_api):
+            return self.block_device_api
+        return ProfiledBlockDeviceAPIAdapter(
+            _blockdevice_api=self.block_device_api
+        )
+
+    @property
+    def async_block_device_api(self):
+        """
+        Get an ``IBlockDeviceAsyncAPI`` provider which can manipulate volumes
+        for this deployer.
+
+        During real operation, this is a threadpool-based wrapper around the
+        ``IBlockDeviceAPI`` provider.  For testing purposes it can be
+        overridden with a different object entirely (and this large amount of
+        support code for this is necessary because this class is a ``PClass``
+        subclass).
+        """
+        if self._async_block_device_api is None:
+            from twisted.internet import reactor
+            return _SyncToThreadedAsyncAPIAdapter(
+                _sync=self.block_device_api,
+                _reactor=reactor,
+                _threadpool=reactor.getThreadPool(),
+            )
+        return self._async_block_device_api
+
+    def discover_state(self, cluster_state):
+        """
+        Find all datasets that are currently associated with this host and
+        return a ``BlockDeviceDeployerLocalState`` containing all the datasets
+        that are not manifest or are located on this node.
+        """
+        return self.state_discoverer.discover_state(cluster_state)
+
+    def _mountpath_for_dataset_id(self, dataset_id):
+        """
+        Calculate the mountpoint for a dataset.
+
+        :param unicode dataset_id: The unique identifier of the dataset for
+            which to calculate a mount point.
+
+        :returns: A ``FilePath`` of the mount point.
+        """
+        return self.mountroot.child(dataset_id.encode("ascii"))
+
     def calculate_changes(self, configuration, cluster_state, local_state):
         local_node_state = cluster_state.get_node(self.node_uuid,
                                                   hostname=self.hostname)
@@ -1803,13 +1849,13 @@ class BlockDeviceDeployer(PClass):
         if local_node_state.applications is None:
             return NoOp()
 
-        desired_datasets = self._calculate_desired_state(
+        desired_datasets = self.state_discoverer.calculate_desired_state(
             configuration=configuration,
             local_applications=local_node_state.applications,
             local_datasets=local_state.datasets,
         )
 
-        return self.calculator.calculate_changes_for_datasets(
+        return self.state_discoverer.calculator.calculate_changes_for_datasets(
             discovered_datasets=local_state.datasets,
             desired_datasets=desired_datasets,
         )
