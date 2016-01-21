@@ -11,7 +11,7 @@
         "secret_key": "{{user `aws_secret_key`}}",
         "region": "us-west-1",
         "source_ami": "{{user `source_ami`}}",
-        "instance_type": "t2.micro",
+        "instance_type": "m3.medium",
         "ssh_username": "ubuntu",
         "ami_name": "clusterhq_ubuntu-14.04_flocker_{{timestamp}}",
         "ami_groups": ["all"],
