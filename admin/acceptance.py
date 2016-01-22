@@ -43,6 +43,7 @@ from flocker.provision._install import (
     uninstall_flocker,
     install_flocker,
     configure_cluster,
+    configure_node,
     configure_zfs,
 )
 from flocker.provision._ca import Certificates
@@ -195,6 +196,24 @@ class IClusterRunner(Interface):
         :param reactor: Reactor to use.
         :return Deferred: That fires with a succesful result if the key is
             found.  Otherwise, fails with ``AgentNotFound`` or ``KeyNotFound``.
+        """
+
+    def create_node():
+        """
+        Create a new node.
+
+        :return: A ``Node`` object representing the new node.
+        """
+
+    def join_node(reactor, control_node, node):
+        """
+        Provision the given node and add it to the Flocker cluster.
+
+        :param reactor: Reactor to use.
+        :param bytes control_node: Name or address of the control node
+            of the cluster.
+        :param Node node: The node to add.
+        :return: Deferred that fires the node is added to the cluster.
         """
 
 
@@ -350,6 +369,12 @@ class ManagedRunner(object):
         Don't stop any nodes.
         """
         return succeed(None)
+
+    def create_node(self):
+        raise UsageError("Can not create a new node for a managed cluster")
+
+    def join_node(self, reactor, control_node, node):
+        raise UsageError("Can not join a new node to a managed cluster")
 
 
 def _provider_for_cluster_id(dataset_backend):
@@ -581,6 +606,12 @@ class VagrantRunner(object):
             ['vagrant', 'destroy', '-f'],
             path=self.vagrant_path.path)
 
+    def create_node(self):
+        raise UsageError("Can not create a new node for a vagrant cluster")
+
+    def join_node(self, reactor, control_node, node):
+        raise UsageError("Can not join a new node to a vagrant cluster")
+
 
 @attributes(RUNNER_ATTRIBUTES + [
     'provisioner', 'num_nodes', 'identity', 'cert_path',
@@ -614,18 +645,8 @@ class LibcloudRunner(object):
             )
         self.creator = creator
 
-    @inlineCallbacks
-    def start_cluster(self, reactor):
-        """
-        Provision cloud cluster for acceptance tests.
-
-        :return Cluster: The cluster to connect to for acceptance tests.
-        """
-        metadata = {
-            'distribution': self.distribution,
-        }
-        metadata.update(self.identity.metadata)
-        metadata.update(self.metadata)
+        self.metadata.update(self.identity.metadata)
+        self.metadata['distribution'] = self.distribution,
 
         # Try to make names unique even if the same creator is starting
         # multiple clusters at the same time.  This lets other code use the
@@ -633,19 +654,67 @@ class LibcloudRunner(object):
         # place, the node creation code, to perform cleanup when the create
         # operation fails in a way such that it isn't clear if the instance has
         # been created or not.
-        random_tag = os.urandom(8).encode("base64").strip("\n=")
-        print "Assigning random tag:", random_tag
+        self.random_tag = os.urandom(8).encode("base64").strip("\n=")
+        print "Assigning random tag:", self.random_tag
 
+    def create_node(self):
+        # num_nodes is a number of already exisiting cluster nodes.
+        index = self.num_nodes
+        name = "%s-%s-%s-%d" % (
+            self.identity.prefix, self.creator, self.random_tag, index,
+        )
+        try:
+            print "Creating node %d: %s" % (index, name)
+            return self.provisioner.create_node(
+                name=name,
+                distribution=self.distribution,
+                metadata=self.metadata,
+            )
+        except BaseException:
+            print "Error creating node %d: %s" % (index, name)
+            print "It may have leaked into the cloud."
+            raise
+
+    @inlineCallbacks
+    def join_node(self, reactor, control_node, node):
+        certificates = Certificates(self.cert_path)
+        node_certnkey = certificates.add_node()
+
+        yield remove_known_host(reactor, node.address)
+
+        commands = node.provision(package_source=self.package_source,
+                                  variants=self.variants)
+        if self.dataset_backend == DatasetBackend.zfs:
+            zfs_commands = configure_zfs(node, variants=self.variants)
+            commands = commands.on(success=lambda _: zfs_commands)
+        yield perform(make_dispatcher(reactor), commands)
+
+        commands = configure_node(
+            control_node, certificates,
+            node, node_certnkey,
+            self.dataset_backend, self.dataset_backend_configuration,
+            None,
+            logging_config=self.config.get('logging'),
+        )
+        yield perform(make_dispatcher(reactor), commands)
+
+    @inlineCallbacks
+    def start_cluster(self, reactor):
+        """
+        Provision cloud cluster for acceptance tests.
+
+        :return Cluster: The cluster to connect to for acceptance tests.
+        """
         for index in range(self.num_nodes):
             name = "%s-%s-%s-%d" % (
-                self.identity.prefix, self.creator, random_tag, index,
+                self.identity.prefix, self.creator, self.random_tag, index,
             )
             try:
                 print "Creating node %d: %s" % (index, name)
                 node = self.provisioner.create_node(
                     name=name,
                     distribution=self.distribution,
-                    metadata=metadata,
+                    metadata=self.metadata,
                 )
             except:
                 print "Error creating node %d: %s" % (index, name)
