@@ -1568,3 +1568,66 @@ def configure_cluster(
             in zip(cluster.certificates.nodes, cluster.agent_nodes)
         ])
     ])
+
+
+def configure_node(
+    control_node_address, certificates,
+    node, certnkey,
+    dataset_backend, dataset_backend_configuration,
+    provider,
+    logging_config=None
+):
+    """
+    Configure flocker-dataset-agent and flocker-container-agent on a node,
+    so that it could join an existing Flocker cluster.
+
+    :param bytes control_node_address: The control node of the cluster.
+    :param Cerificates certificates: The cluster certificates.
+    :param Node node: The node to configure.
+    :param CertAndKey certnkey: The node's certificate and key.
+    :param dataset_backend: Dataset backend.
+    :param dict dataset_backend_configuration: Configuration parameters to
+        supply to the dataset backend.
+    :param bytes provider: provider of the nodes  - aws. rackspace or managed.
+    :param dict logging_config: A Python logging configuration dictionary,
+        following the structure of PEP 391.
+    """
+    setup_action = 'start'
+    if provider == "managed":
+        setup_action = 'restart'
+
+    return sequence([
+        sequence([
+            run_remotely(
+                username='root',
+                address=node.address,
+                commands=sequence([
+                    task_install_node_certificates(
+                        certificates.cluster.certificate,
+                        certnkey.certificate,
+                        certnkey.key),
+                    task_install_api_certificates(
+                        certificates.user.certificate,
+                        certificates.user.key),
+                    task_enable_docker(node.distribution),
+                    if_firewall_available(
+                        node.distribution,
+                        open_firewall_for_docker_api(node.distribution),
+                    ),
+                    task_configure_flocker_agent(
+                        control_node=control_node_address,
+                        dataset_backend=dataset_backend,
+                        dataset_backend_configuration=(
+                            dataset_backend_configuration
+                        ),
+                        logging_config=logging_config,
+                    ),
+                    task_enable_docker_plugin(node.distribution),
+                    task_enable_flocker_agent(
+                        distribution=node.distribution,
+                        action=setup_action,
+                    ),
+                ]),
+            ),
+        ])
+    ])
