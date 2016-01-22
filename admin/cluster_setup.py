@@ -58,7 +58,6 @@ class RunOptions(CommonOptions):
         self['dataset-backend'] = self.defaults['dataset-backend'] = 'aws'
 
     def postOptions(self):
-
         self['purpose'] = unicode(self['purpose'])
         if any(x not in string.ascii_letters + string.digits + '-'
                for x in self['purpose']):
@@ -66,15 +65,17 @@ class RunOptions(CommonOptions):
                 "Purpose may have only alphanumeric symbols and dash. " +
                 "Found {!r}".format('purpose')
             )
-
-        if self['cert-directory']:
-            cert_path = FilePath(self['cert-directory'])
-            _ensure_empty_directory(cert_path)
-            self['cert-directory'] = cert_path
+        self._check_cert_directory()
 
         # This is run last as it creates the actual "runner" object
         # based on the provided parameters.
         super(RunOptions, self).postOptions()
+
+    def _check_cert_directory(self):
+        if self['cert-directory']:
+            cert_path = FilePath(self['cert-directory'])
+            _ensure_empty_directory(cert_path)
+            self['cert-directory'] = cert_path
 
     def _make_cluster_identity(self, dataset_backend):
         purpose = self['purpose']
@@ -206,8 +207,12 @@ def main(reactor, args, base_path, top_level):
             capture_upstart(reactor, node.address,
                             remote_logs_file).addErrback(write_failure)
 
-    flocker_client = _make_client(reactor, cluster)
-    yield _wait_for_nodes(reactor, flocker_client, len(cluster.agent_nodes))
+    flocker_client = make_client(
+        reactor,
+        cluster.control_node.address,
+        cluster.certificates_path,
+    )
+    yield wait_for_nodes(reactor, flocker_client, len(cluster.agent_nodes))
 
     if options['no-keep']:
         print("not keeping cluster")
@@ -236,17 +241,18 @@ def main(reactor, args, base_path, top_level):
         reactor.removeSystemEventTrigger(cleanup_trigger_id)
 
 
-def _make_client(reactor, cluster):
+def make_client(reactor, control_node, certificates_path):
     """
     Create a :class:`FlockerClient` object for accessing the given cluster.
 
     :param reactor: The reactor.
-    :param flocker.provision._common.Cluster cluster: The target cluster.
+    :param bytes control_node: Address or host name of the cluster's
+        control node.
+    :param FilePath certificates_path: Path to a directory with the cluster's
+        certificates.
     :return: The client object.
     :rtype: flocker.apiclient.FlockerClient
     """
-    control_node = cluster.control_node.address
-    certificates_path = cluster.certificates_path
     cluster_cert = certificates_path.child(b"cluster.crt")
     user_cert = certificates_path.child(b"user.crt")
     user_key = certificates_path.child(b"user.key")
@@ -254,7 +260,7 @@ def _make_client(reactor, cluster):
                          cluster_cert, user_cert, user_key)
 
 
-def _wait_for_nodes(reactor, client, count):
+def wait_for_nodes(reactor, client, count):
     """
     Wait until nodes join the cluster.
 
