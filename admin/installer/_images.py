@@ -7,7 +7,7 @@ Helper utilities for CloudFormation Installer's Packer images.
 import json
 import sys
 
-from subprocess import check_call
+from subprocess import check_output
 
 from twisted.python.filepath import FilePath
 from twisted.python.usage import Options, UsageError
@@ -139,7 +139,18 @@ def _packer_amis(packer_output):
             return _unserialize_packer_dict(artifact["id"])
 
 
-def publish_installer_images_main(args, base_path, top_level):
+class RealCommands(object):
+    def packer_build(self, template_path):
+        command = ['packer', 'build',
+                   '-var', "flocker_branch=master",
+                   '-var', "source_ami=ami-aa1064ca",
+                   '-machine-readable', template_path.path]
+        return check_output(command)
+
+
+def publish_installer_images_main(args, base_path, top_level,
+                                  sys_module=sys,
+                                  commands=None):
     """
     Publish installer images.
 
@@ -147,25 +158,22 @@ def publish_installer_images_main(args, base_path, top_level):
     :param FilePath base_path: The executable being run.
     :param FilePath top_level: The top-level of the flocker repository.
     """
+    if commands is None:
+        commands = RealCommands()
+
     options = PublishInstallerImagesOptions()
 
     try:
         options.parseOptions(args)
     except UsageError as e:
-        sys.stderr.write("%s: %s\n" % (base_path.basename(), e))
+        sys_module.stderr.write(
+            "Usage Error: %s: %s\n" % (base_path.basename(), e)
+        )
         raise SystemExit(1)
     # template_path = FilePath(__file__).parent().descendant(
     #     ['packer', 'template_ubuntu-14.04_flocker.json'])
     aws_region = 'us-west-1'
     template_path = _get_flocker_base_template_json(aws_region)
-    print "TEMPLATE PATH"
-    print template_path
-    command = ['packer', 'build',
-               '-var', "flocker_branch=master",
-               '-var', "source_ami=ami-aa1064ca",
-               '-machine-readable', template_path.path]
-    print ' '.join(command)
-    output = check_call(command)
-
-    print "PACKER OUTPUT"
-    print output
+    output = commands.packer_build(template_path)
+    ami_map = _packer_amis(output)
+    print json.dumps(ami_map)

@@ -263,7 +263,9 @@ class FakeSysModule(object):
     :ivar stdout: A :py:class:`io.BytesIO` object representing standard output.
     :ivar stderr: A :py:class:`io.BytesIO` object representing standard error.
     """
-    def __init__(self, argv=None):
+    exit_status = None
+
+    def __init__(self, argv=None, system_exit_type=SystemExit):
         """Initialise the fake sys module.
 
         :param list argv: The arguments list which should be exposed as
@@ -278,6 +280,9 @@ class FakeSysModule(object):
         # unicode.
         self.stdout = io.BytesIO()
         self.stderr = io.BytesIO()
+
+    def exit(self, status=1):
+        self.exit_status = status
 
 
 def make_flocker_script_test(script, options, command_name):
